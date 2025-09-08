@@ -1,0 +1,30 @@
+---
+title: "Fraud Risk Simulation"
+image: ../images/fraud-sim.png
+categories: [AI, Risk, Python]
+page-layout: article
+toc: true
+---
+
+## Summary
+A Monte Carlo engine that quantifies monthly fraud losses and model **risk limits** with automated **sensitivity**. It demonstrates executive storytelling, reproducible analytics, and clear KPIs: **Expected Loss**, **VaR(95)**, **CVaR(95)**, and **Budget Breach Probability**.
+
+## Business Context
+Fraud leaders must set monthly loss budgets, evaluate model detection rates, and justify spend on controls. This simulator tests whether the current posture keeps losses within budget under baseline and stress conditions.
+
+## Method
+- **Frequency**: Fraud count ~ Poisson(λ = *transactions* × *fraud rate*).
+- **Severity**: Undetected fraud losses ~ Lognormal(*μ, σ*).
+- **Controls**: Detection rate reduces realized fraud; we track breach probability vs. budget.
+- **Sensitivity**: Tornado-style one-way perturbations of key drivers (fraud rate, detection, severity σ).
+
+## KPIs & Report
+Run `python run_simulation.py` and view `outputs/report.md`. It includes distribution and sensitivity plots.
+
+## Extend
+- Plug your fraud score model to calibrate *p(fraud)* by decile.
+- Add costs for false positives and ops load.
+- Stress scenarios via `scenarios.make_stress` or Latin-hypercube `lhs_samples`.
+
+## Code
+The core engine lives in `fraud_risk_sim/`. A Streamlit app at `app/app.py` offers interactive exploration.

@@ -1,0 +1,27 @@
+@'
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.sagemaker/
+.pytype/
+.pytest_cache/
+.mypy_cache/
+
+# --- Tools / IDE ---
+.vscode/
+.idea/
+
+# --- OS junk ---
+.DS_Store
+Thumbs.db
+
+# --- Build / Reports / App cache ---
+dist/
+build/
+outputs/
+.streamlit/
+'@ | Out-File -Encoding utf8 .gitignore
