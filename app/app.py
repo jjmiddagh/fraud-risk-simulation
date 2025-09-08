@@ -1,3 +1,9 @@
+
+# allow imports from the project root (so fraud_risk_sim works on Cloud)
+from pathlib import Path
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import streamlit as st
 from fraud_risk_sim.config import SimConfig
 from fraud_risk_sim.scenarios import make_baseline
