@@ -1,187 +1,201 @@
-# allow imports from the project root (so fraud_risk_sim works locally and on Cloud)
-from pathlib import Path
-import sys
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+# app/app.py
+# Streamlit Fraud Risk Simulation UI (complete)
+# - Plain-English collapsible "How it works"
+# - Stats table ABOVE the chart
+# - Altair histogram with rounded x-axis values (configurable decimals)
+# - Bin count + Y-scale controls
+# - CSV downloads
+#
+# Requires: streamlit, numpy, pandas, (altair recommended)
 
+import time
+import numpy as np
+import pandas as pd
 import streamlit as st
-from fraud_risk_sim.config import SimConfig
-from fraud_risk_sim.scenarios import make_baseline
-from fraud_risk_sim.simulation import run_monte_carlo
-from fraud_risk_sim.metrics import kpis
-from fraud_risk_sim.sensitivity import tornado_data
-from fraud_risk_sim.report import save_hist, save_tornado
 
-st.set_page_config(page_title="Fraud Risk Simulator", page_icon="🛡️", layout="wide")
-st.title("Fraud Risk Simulator")
+# ---------------- Simulation binding ----------------
+# If you have your own engine at src/simulation.py with:
+#   def run_simulation(n_sims, fraud_rate, severity_mu, severity_sigma, seed=None) -> np.ndarray
+# this will use it. Otherwise, we fall back to a simple Bernoulli*Lognormal toy model.
+SIM_IMPL = None
+try:
+    from src.simulation import run_simulation as _run_simulation  # type: ignore
+    SIM_IMPL = "external"
+except Exception:
+    SIM_IMPL = "internal"
 
-# ===== Instructions (right-side content) =====
-INSTRUCTIONS = """
-**What it simulates**  
-- A Monte Carlo portfolio of transactions over a chosen time horizon.  
-- A base **fraud rate** determines how many are truly fraudulent.  
-- A **model score** is generated for each txn; higher for fraud, lower for non-fraud, with overlap governed by **model quality / detection rate**.  
-- A **decision policy** flags txns; we compute **TP/FP/FN/TN** and monetize outcomes.
+def run_simulation(n_sims: int, fraud_rate: float, severity_mu: float, severity_sigma: float, seed: int | None) -> np.ndarray:
+    if SIM_IMPL == "external":
+        return _run_simulation(
+            n_sims=n_sims,
+            fraud_rate=fraud_rate,
+            severity_mu=severity_mu,
+            severity_sigma=severity_sigma,
+            seed=seed,
+        )
+    # Fallback toy engine
+    rng = np.random.default_rng(seed)
+    fraud_flags = rng.binomial(n=1, p=fraud_rate, size=n_sims)
+    severities = rng.lognormal(mean=severity_mu, sigma=severity_sigma, size=n_sims)
+    losses = fraud_flags * severities
+    return losses
 
-**Quick start**  
-1. Set **Monthly transactions** and **Average ticket**.  
-2. Choose **Base fraud rate** (fraction like 0.003 = 0.3%).  
-3. Set **Detection rate** and loss **severity** (μ, σ for lognormal).  
-4. Choose **Simulation paths** (more = tighter confidence) and **Random seed**.  
-5. Click **Run Simulation**.
+def summarize_losses(losses: np.ndarray, var_levels=(0.95, 0.99)) -> pd.DataFrame:
+    if losses.size == 0:
+        return pd.DataFrame()
+    s = pd.Series(losses)
+    out = {
+        "samples": int(s.size),
+        "mean": s.mean(),
+        "std": s.std(ddof=1),
+        "min": s.min(),
+        "p50": s.quantile(0.50),
+        "p90": s.quantile(0.90),
+        "p95": s.quantile(0.95),
+        "p99": s.quantile(0.99),
+        "max": s.max(),
+        "nonzero_rate": float((s > 0).mean()),
+        "total_loss": s.sum(),
+    }
+    for q in var_levels:
+        var_q = s.quantile(q)
+        tail = s[s >= var_q]
+        cvar_q = tail.mean() if not tail.empty else var_q
+        out[f"VaR@{int(q*100)}"] = var_q
+        out[f"CVaR@{int(q*100)}"] = cvar_q
+    return pd.DataFrame([out])
 
-**Key inputs**  
-- **Base fraud rate** – prevalence of fraud.  
-- **Detection rate** – probability your controls flag fraud (at the chosen policy).  
-- **Loss severity (μ, σ)** – lognormal parameters governing fraud loss sizes.  
-- **Monthly loss budget ($)** – threshold to compute breach probability.  
+# ---------------- UI ----------------
+st.set_page_config(page_title="Fraud Risk Simulation", page_icon="🎲", layout="wide")
+st.title("🎲 Fraud Risk Simulation")
 
-**Outputs**  
-- **KPIs**: Expected net impact, Fraud blocked / Missed, FP cost, Budget breach probability.  
-- **Loss distribution** (histogram) and **Sensitivity (tornado)**.
-"""
+with st.expander("How it works (for everyone)", expanded=False):
+    st.markdown(
+        """
+**Goal**  
+Get a quick picture of how much money fraud could cost under different assumptions.
 
-# ====== TOP: two vertical blocks next to each other ======
-left, right = st.columns([7,5], gap="large")
+**What you do**  
+- Adjust the sliders for how often fraud might happen and how big a fraud loss might be.  
+- Click **Run**.
 
-with left:
-    st.subheader("Controls")
+**What happens behind the scenes**  
+- Imagine flipping a coin thousands of times. Each flip decides whether a case is fraud (based on the Fraud rate you set).  
+- When fraud occurs, we roll the dice to see *how large the loss is*.  
+- Doing this many times builds up a picture of both *typical outcomes* and *rare but costly ones*.
 
-    # Use a baseline config for defaults
-    try:
-        cfg = make_baseline()
-    except Exception:
-        # Fallback defaults if make_baseline isn't available at runtime
-        class _Cfg: pass
-        cfg = _Cfg()
-        cfg.n_transactions = 500_000
-        cfg.avg_ticket = 50.0
-        cfg.base_fraud_rate = 0.003
-        cfg.detection_rate = 0.72
-        cfg.sev_mu = 3.2
-        cfg.sev_sigma = 1.1
-        cfg.monthly_loss_budget = 250_000.0
-        cfg.seed = 42
-
-    with st.form("sim_inputs"):
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            n_transactions = st.number_input(
-                "Monthly transactions",
-                value=int(getattr(cfg, "n_transactions", 500_000)),
-                step=10_000,
-                help="Average monthly transaction count; totals scale with this."
-            )
-            avg_ticket = st.number_input(
-                "Average ticket ($)",
-                value=float(getattr(cfg, "avg_ticket", 50.0)),
-                step=1.0,
-                help="Average transaction amount used to translate rates into dollars."
-            )
-            base_fraud_rate = st.number_input(
-                "Base fraud rate",
-                value=float(getattr(cfg, "base_fraud_rate", 0.003)),
-                step=0.0001, format="%.4f",
-                help="Fraction of transactions that are truly fraudulent (e.g., 0.003 = 0.3%)."
-            )
-
-        with c2:
-            detection_rate = st.slider(
-                "Detection rate",
-                min_value=0.0, max_value=1.0,
-                value=float(getattr(cfg, "detection_rate", 0.72)), step=0.01,
-                help="Probability your controls flag a fraudulent txn at the chosen policy."
-            )
-            sev_mu = st.number_input(
-                "Severity μ (log space)",
-                value=float(getattr(cfg, "sev_mu", 3.2)), step=0.1,
-                help="Mean of lognormal fraud severity (log space). Higher ⇒ larger typical losses."
-            )
-            sev_sigma = st.number_input(
-                "Severity σ",
-                value=float(getattr(cfg, "sev_sigma", 1.1)), step=0.05,
-                help="Std dev of lognormal severity; higher ⇒ heavier tails (more extreme losses)."
-            )
-
-        with c3:
-            monthly_loss_budget = st.number_input(
-                "Monthly loss budget ($)",
-                value=float(getattr(cfg, "monthly_loss_budget", 250_000.0)),
-                step=10_000.0,
-                help="Budget threshold used to compute breach probability."
-            )
-            n_paths = st.slider(
-                "Simulation paths",
-                min_value=5_000, max_value=100_000,
-                value=20_000, step=5_000,
-                help="Monte Carlo trials; more = tighter confidence on KPIs (slower)."
-            )
-            seed = st.number_input(
-                "Random seed",
-                value=int(getattr(cfg, "seed", 42)), step=1,
-                help="Set for reproducible results."
-            )
-
-        submitted = st.form_submit_button("Run Simulation")
-
-with right:
-    st.subheader("How it works")
-    st.markdown(INSTRUCTIONS)
-
-# ====== BOTTOM: horizontal block with outputs ======
-st.divider()
-results_area = st.container()
-
-if submitted:
-    params = dict(
-        n_transactions=int(n_transactions),
-        avg_ticket=float(avg_ticket),
-        base_fraud_rate=float(base_fraud_rate),
-        detection_rate=float(detection_rate),
-        # retaining placeholder for compatibility if your engine expects it:
-        false_positive_rate=getattr(cfg, "false_positive_rate", 0.0),
-        sev_mu=float(sev_mu),
-        sev_sigma=float(sev_sigma),
-        monthly_loss_budget=float(monthly_loss_budget),
+**How to read the results**  
+- **Average (Mean)** → what you normally expect to lose.  
+- **Percentiles (95th / 99th)** → in 95% or 99% of cases, losses are lower than this.  
+- **Worst-case thresholds (VaR)** → the cut-off for the worst few percent of scenarios.  
+- **Severe tail losses (CVaR)** → if you land in those worst cases, this is the *average hit* you take.
+        """
     )
 
-    with results_area:
+# Sidebar controls
+st.sidebar.header("Parameters")
+n_sims = st.sidebar.number_input("Number of simulations", min_value=1_000, max_value=5_000_000, value=100_000, step=10_000)
+fraud_rate = st.sidebar.slider("Fraud rate (probability)", min_value=0.0, max_value=0.2, value=0.03, step=0.001)
+severity_mu = st.sidebar.slider("Severity log-μ", min_value=-2.0, max_value=5.0, value=1.2, step=0.1, help="Higher → larger typical loss when fraud occurs.")
+severity_sigma = st.sidebar.slider("Severity log-σ", min_value=0.1, max_value=2.0, value=0.8, step=0.1, help="Higher → more variable/tail-heavy losses.")
+seed = st.sidebar.number_input("Random seed (optional)", min_value=0, max_value=10_000_000, value=42, step=1)
+
+st.subheader("Run Simulation")
+left, right = st.columns([1, 1])
+with left:
+    run_clicked = st.button("Run", type="primary")
+
+# Session state for results
+if "losses" not in st.session_state:
+    st.session_state.losses = None
+if "stats" not in st.session_state:
+    st.session_state.stats = None
+
+# Run
+if run_clicked:
+    t0 = time.time()
+    losses = run_simulation(
+        n_sims=int(n_sims),
+        fraud_rate=float(fraud_rate),
+        severity_mu=float(severity_mu),
+        severity_sigma=float(severity_sigma),
+        seed=int(seed),
+    )
+    dt = time.time() - t0
+    stats = summarize_losses(losses)
+    stats.insert(0, "runtime_sec", round(dt, 3))
+    stats.insert(0, "engine", SIM_IMPL)
+    st.session_state.losses = losses
+    st.session_state.stats = stats
+
+# ---------------- Output: table FIRST, then chart ----------------
+if st.session_state.stats is not None:
+    # Stats table
+    st.markdown("### Output Statistics")
+    st.dataframe(st.session_state.stats, use_container_width=True)
+
+    # Chart controls
+    st.markdown("##### Distribution (non-zero losses)")
+    nz = st.session_state.losses[st.session_state.losses > 0]
+
+    if nz.size == 0:
+        st.info("All simulated losses are zero under current parameters.")
+    else:
+        c1, c2, c3 = st.columns([1, 1, 1])
+        with c1:
+            bins = st.slider("Bin count", 10, 100, 40, 5)
+        with c2:
+            y_scale = st.selectbox("Y scale", ["Linear", "Log"], index=0)
+        with c3:
+            dec = st.slider("Axis decimals", 0, 8, 6)  # controls rounding on x-axis
+
+        # Preferred: Altair chart with rounded labels
         try:
-            res = run_monte_carlo(params, cfg_seed=int(seed), n_paths=int(n_paths))
-        except TypeError:
-            # Fallback signature without cfg_seed if your function differs
-            res = run_monte_carlo(params, int(seed), int(n_paths))
+            import altair as alt
 
-        # KPIs table/metrics
-        try:
-            summary = kpis(params, res)
-        except Exception as e:
-            summary = None
+            df = pd.DataFrame({"loss": nz})
+            fmt = f".{dec}f"  # e.g., ".6f" -> 0.675787
 
-        # Show KPIs cleanly
-        if summary:
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Expected Net Impact ($)", f"{summary.get('net_impact_mean', 0):,.0f}")
-            m2.metric("Fraud Blocked ($)", f"{summary.get('blocked_mean', 0):,.0f}")
-            m3.metric("Missed Fraud ($)", f"{summary.get('missed_mean', 0):,.0f}")
-            m4.metric("Budget Breach P(%)", f"{100*summary.get('budget_breach_prob', 0):.1f}%")
+            y_scale_cfg = alt.Scale(type="log") if y_scale == "Log" else alt.Scale(type="linear")
 
-        # Charts: histogram and tornado; saved to outputs/ then displayed
-        outdir = Path('outputs'); outdir.mkdir(exist_ok=True)
-        hist_png = outdir / 'loss_hist.png'
-        tor_png = outdir / 'tornado.png'
+            chart = (
+                alt.Chart(df)
+                .transform_bin("loss_bin", "loss", maxbins=bins)
+                .mark_bar()
+                .encode(
+                    x=alt.X(
+                        "loss_bin:Q",
+                        axis=alt.Axis(
+                            title="Loss",
+                            format=fmt,       # rounded axis labels
+                            labelAngle=45,    # rotate to avoid crowding (set 90 for vertical)
+                            labelOverlap=False,
+                        ),
+                    ),
+                    y=alt.Y("count()", title="Count", scale=y_scale_cfg),
+                    tooltip=[
+                        alt.Tooltip("loss_bin:Q", title="Bin start", format=fmt),
+                        alt.Tooltip("count()", title="Count"),
+                    ],
+                )
+                .properties(height=280)
+            )
+            st.altair_chart(chart, use_container_width=True)
+        except Exception:
+            # Fallback if Altair isn't available: rounded labels too
+            counts, edges = np.histogram(nz, bins=bins)
+            mids = (edges[:-1] + edges[1:]) / 2
+            labels = np.round(mids, dec).astype(str)
+            hist_df = pd.DataFrame({"loss_bin": labels, "count": counts}).set_index("loss_bin")
+            st.bar_chart(hist_df["count"])
 
-        try:
-            save_hist(res['losses'], hist_png)
-            base_mean, bars = tornado_data(params, cfg_seed=int(seed), n_paths=min(50000, int(n_paths)), perturb=0.2)
-            save_tornado(bars, tor_png)
+    # Downloads
+    stats_csv = st.session_state.stats.to_csv(index=False).encode("utf-8")
+    st.download_button("Download stats (CSV)", data=stats_csv, file_name="simulation_stats.csv", mime="text/csv")
 
-            st.subheader("Loss Distribution")
-            st.image(str(hist_png))
-
-            st.subheader("Sensitivity (Tornado)")
-            st.image(str(tor_png))
-        except Exception as e:
-            st.error(f"Could not render charts: {e}")
-
-st.caption('© ' + str(__import__('datetime').datetime.now().year) + ' Joshua J. Middagh')
+    if st.checkbox("Include raw losses CSV (may be large)"):
+        losses_df = pd.DataFrame({"loss": st.session_state.losses})
+        losses_csv = losses_df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download raw losses (CSV)", data=losses_csv, file_name="losses.csv", mime="text/csv")
+else:
+    st.info("Set the sliders on the left, then click **Run** to generate results.")
